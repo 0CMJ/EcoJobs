@@ -1,23 +1,21 @@
 name: ${pluginName}
 version: ${version}
 main: com.willfp.ecojobs.EcoJobsPlugin
-api-version: 1.17
-authors: [ Auxilor ]
-website: willfp.com
-depend:
-  - eco
-softdepend:
-  - libreforge
-commands:
-  ecojobs:
-    description: Base Command
-    permission: ecojobs.command.ecojobs
-  jobs:
-    aliases:
-      - job
-    description: Open the jobs menu
-    permission: ecojobs.command.jobs
-    default: true
+api-version: 1.19
+
+dependencies:
+  - name: eco
+    required: true
+    bootstrap: false
+
+  - name: libreforge
+    required: false
+    bootstrap: false
+
+load-after:
+  - name: eco
+    bootstrap: false
+
 
 permissions:
   ecojobs.*:

@@ -4,7 +4,6 @@ import com.github.benmanes.caffeine.cache.Caffeine
 import com.willfp.eco.core.config.interfaces.Config
 import com.willfp.eco.core.data.keys.PersistentDataKey
 import com.willfp.eco.core.data.keys.PersistentDataKeyType
-import com.willfp.eco.core.data.profile
 import com.willfp.eco.core.items.Items
 import com.willfp.eco.core.items.builder.ItemStackBuilder
 import com.willfp.eco.core.placeholder.PlayerPlaceholder
@@ -12,46 +11,54 @@ import com.willfp.eco.core.placeholder.PlayerStaticPlaceholder
 import com.willfp.eco.core.placeholder.PlayerlessPlaceholder
 import com.willfp.eco.core.price.ConfiguredPrice
 import com.willfp.eco.core.price.impl.PriceEconomy
+import com.willfp.eco.core.registry.Registrable
 import com.willfp.eco.util.NumberUtils
 import com.willfp.eco.util.formatEco
 import com.willfp.eco.util.toNiceString
 import com.willfp.ecojobs.EcoJobsPlugin
-import com.willfp.ecojobs.api.event.PlayerJobExpGainEvent
-import com.willfp.ecojobs.api.event.PlayerJobJoinEvent
-import com.willfp.ecojobs.api.event.PlayerJobLeaveEvent
-import com.willfp.ecojobs.api.event.PlayerJobLevelUpEvent
+import com.willfp.ecojobs.api.activeJobs
+import com.willfp.ecojobs.api.canJoinJob
+import com.willfp.ecojobs.api.getJobLevel
+import com.willfp.ecojobs.api.getJobProgress
+import com.willfp.ecojobs.api.getJobXP
+import com.willfp.ecojobs.api.getJobXPRequired
+import com.willfp.ecojobs.api.hasJobActive
+import com.willfp.ecojobs.api.jobLimit
+import com.willfp.libreforge.ViolationContext
+import com.willfp.libreforge.conditions.ConditionList
 import com.willfp.libreforge.conditions.Conditions
-import com.willfp.libreforge.conditions.ConfiguredCondition
-import com.willfp.libreforge.effects.ConfiguredEffect
+import com.willfp.libreforge.counters.Counters
+import com.willfp.libreforge.effects.EffectList
 import com.willfp.libreforge.effects.Effects
-import com.willfp.libreforge.events.TriggerPreProcessEvent
-import com.willfp.libreforge.triggers.Counters
 import org.bukkit.Bukkit
 import org.bukkit.OfflinePlayer
 import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemStack
+import java.time.Duration
 import java.util.Objects
 import java.util.concurrent.TimeUnit
-import kotlin.math.abs
+import kotlin.math.max
 
 class Job(
     val id: String,
     val config: Config,
     private val plugin: EcoJobsPlugin
-) {
+) : Registrable {
+    private val topCache = Caffeine.newBuilder()
+        .expireAfterWrite(Duration.ofSeconds(plugin.configYml.getInt("leaderboard-cache-lifetime").toLong()))
+        .build<Int, LeaderboardCacheEntry?>()
+
     val name = config.getFormattedString("name")
     val description = config.getFormattedString("description")
     val isUnlockedByDefault = config.getBool("unlocked-by-default")
     val resetsOnQuit = config.getBool("reset-on-quit")
 
     val joinPrice = ConfiguredPrice.create(config.getSubsection("join-price")) ?: ConfiguredPrice(
-        PriceEconomy(config.getDouble("join-price")),
-        ""
+        PriceEconomy(config.getDouble("join-price")), ""
     )
 
     val leavePrice = ConfiguredPrice.create(config.getSubsection("leave-price")) ?: ConfiguredPrice(
-        PriceEconomy(config.getDouble("leave-price")),
-        ""
+        PriceEconomy(config.getDouble("leave-price")), ""
     )
 
     val levelKey: PersistentDataKey<Int> = PersistentDataKey(
@@ -61,9 +68,7 @@ class Job(
     )
 
     val xpKey: PersistentDataKey<Double> = PersistentDataKey(
-        EcoJobsPlugin.instance.namespacedKeyFactory.create("${id}_xp"),
-        PersistentDataKeyType.DOUBLE,
-        0.0
+        EcoJobsPlugin.instance.namespacedKeyFactory.create("${id}_xp"), PersistentDataKeyType.DOUBLE, 0.0
     )
 
     private val levelXpRequirements = listOf(0) + config.getInts("level-xp-requirements")
@@ -76,52 +81,46 @@ class Job(
 
     private val baseItem: ItemStack = Items.lookup(config.getString("icon")).item
 
-    private val effects: Set<ConfiguredEffect>
-    private val conditions: Set<ConfiguredCondition>
+    private val effects: EffectList
+    private val conditions: ConditionList
 
-    private val levels = Caffeine.newBuilder()
-        .build<Int, JobLevel>()
-    private val effectsDescription = Caffeine.newBuilder()
-        .build<Int, List<String>>()
-    private val rewardsDescription = Caffeine.newBuilder()
-        .build<Int, List<String>>()
-    private val levelUpMessages = Caffeine.newBuilder()
-        .build<Int, List<String>>()
+    private val levels = Caffeine.newBuilder().build<Int, JobLevel>()
+    private val effectsDescription = Caffeine.newBuilder().build<Int, List<String>>()
+    private val rewardsDescription = Caffeine.newBuilder().build<Int, List<String>>()
+    private val levelUpMessages = Caffeine.newBuilder().build<Int, List<String>>()
 
     private val levelCommands = mutableMapOf<Int, MutableList<String>>()
 
-    private val levelPlaceholders = config.getSubsections("level-placeholders")
-        .map { sub ->
-            LevelPlaceholder(
-                sub.getString("id")
-            ) {
-                NumberUtils.evaluateExpression(
-                    sub.getString("value")
-                        .replace("%level%", it.toString())
-                ).toNiceString()
-            }
+    private val levelPlaceholders = config.getSubsections("level-placeholders").map { sub ->
+        LevelPlaceholder(
+            sub.getString("id")
+        ) {
+            NumberUtils.evaluateExpression(
+                sub.getString("value").replace("%level%", it.toString())
+            ).toNiceString()
         }
+    }
 
     private val jobXpGains = config.getSubsections("xp-gain-methods").mapNotNull {
-        Counters.compile(it, "Job $id")
+        Counters.compile(it, ViolationContext(plugin, "Job $id"))
     }
 
     init {
-        config.injectPlaceholders(
-            PlayerStaticPlaceholder(
-                "level"
-            ) { p ->
-                p.getJobLevel(this).toString()
-            }
+        config.injectPlaceholders(PlayerStaticPlaceholder(
+            "level"
+        ) { p ->
+            p.getJobLevel(this).toString()
+        })
+
+        effects = Effects.compile(
+            config.getSubsections("effects"),
+            ViolationContext(plugin, "Job $id")
         )
 
-        effects = config.getSubsections("effects").mapNotNull {
-            Effects.compile(it, "Job $id")
-        }.toSet()
-
-        conditions = config.getSubsections("conditions").mapNotNull {
-            Conditions.compile(it, "Job $id")
-        }.toSet()
+        conditions = Conditions.compile(
+            config.getSubsections("conditions"),
+            ViolationContext(plugin, "Job $id")
+        )
 
         for (string in config.getStrings("level-commands")) {
             val split = string.split(":")
@@ -143,57 +142,64 @@ class Job(
         }
 
         PlayerPlaceholder(
-            plugin,
-            "${id}_percentage_progress"
+            plugin, "${id}_percentage_progress"
         ) {
             (it.getJobProgress(this) * 100).toNiceString()
         }.register()
 
         PlayerPlaceholder(
-            plugin,
-            id
+            plugin, id
         ) {
             it.getJobLevel(this).toString()
         }.register()
 
         PlayerPlaceholder(
-            plugin,
-            "${id}_current_xp"
+            plugin, "${id}_current_xp"
         ) {
             NumberUtils.format(it.getJobXP(this))
         }.register()
 
         PlayerPlaceholder(
-            plugin,
-            "${id}_required_xp"
+            plugin, "${id}_required_xp"
         ) {
             it.getJobXPRequired(this).toString()
         }.register()
 
         PlayerlessPlaceholder(
-            plugin,
-            "${id}_name"
+            plugin, "${id}_name"
         ) {
             this.name
         }.register()
 
         PlayerPlaceholder(
-            plugin,
-            "${id}_level"
+            plugin, "${id}_level"
         ) {
             it.getJobLevel(this).toString()
         }.register()
 
         PlayerPlaceholder(
-            plugin,
-            "${id}_total_players"
+            plugin, "${id}_active"
         ) {
-            Bukkit.getOfflinePlayers().count { it.activeJob == this }.toString()
+            it.hasJobActive(this).toString()
+        }.register()
+
+        PlayerPlaceholder(
+            plugin, "${id}_total_players"
+        ) {
+            Bukkit.getOfflinePlayers().count { this in it.activeJobs }.toString()
         }.register()
     }
 
+    override fun onRegister() {
+        jobXpGains.forEach { it.bind(JobXPAccumulator(this)) }
+    }
+
+    override fun onRemove() {
+        jobXpGains.forEach { it.unbind() }
+    }
+
     fun getLevel(level: Int): JobLevel = levels.get(level) {
-        JobLevel(this, it, effects, conditions)
+        JobLevel(plugin, this, it, effects, conditions)
     }
 
     private fun getLevelUpMessages(level: Int, whitespace: Int = 0): List<String> = levelUpMessages.get(level) {
@@ -208,13 +214,11 @@ class Job(
             }
         }
 
-        this.config.getStrings("level-up-messages.$highestConfiguredLevel")
-            .map {
-                levelPlaceholders.format(it, level)
-            }
-            .map {
-                " ".repeat(whitespace) + it
-            }
+        this.config.getStrings("level-up-messages.$highestConfiguredLevel").map {
+            levelPlaceholders.format(it, level)
+        }.map {
+            " ".repeat(whitespace) + it
+        }
     }
 
     private fun getEffectsDescription(level: Int, whitespace: Int = 0): List<String> = effectsDescription.get(level) {
@@ -229,13 +233,11 @@ class Job(
             }
         }
 
-        this.config.getStrings("effects-description.$highestConfiguredLevel")
-            .map {
-                levelPlaceholders.format(it, level)
-            }
-            .map {
-                " ".repeat(whitespace) + it
-            }
+        this.config.getStrings("effects-description.$highestConfiguredLevel").map {
+            levelPlaceholders.format(it, level)
+        }.map {
+            " ".repeat(whitespace) + it
+        }
     }
 
     private fun getRewardsDescription(level: Int, whitespace: Int = 0): List<String> = rewardsDescription.get(level) {
@@ -250,53 +252,41 @@ class Job(
             }
         }
 
-        this.config.getStrings("rewards-description.$highestConfiguredLevel")
-            .map {
-                levelPlaceholders.format(it, level)
-            }
-            .map {
-                " ".repeat(whitespace) + it
-            }
+        this.config.getStrings("rewards-description.$highestConfiguredLevel").map {
+            levelPlaceholders.format(it, level)
+        }.map {
+            " ".repeat(whitespace) + it
+        }
     }
 
-    private fun getLeaveLore(level: Int, whitespace: Int = 0): List<String> =
-        this.config.getStrings("leave-lore")
-            .map {
-                levelPlaceholders.format(it, level)
-            }
-            .map {
-                " ".repeat(whitespace) + it
-            }
+    private fun getLeaveLore(level: Int, whitespace: Int = 0): List<String> = this.config.getStrings("leave-lore").map {
+        levelPlaceholders.format(it, level)
+    }.map {
+        " ".repeat(whitespace) + it
+    }
 
-    private fun getJoinLore(level: Int, whitespace: Int = 0): List<String> =
-        this.config.getStrings("join-lore")
-            .map {
-                levelPlaceholders.format(it, level)
-            }
-            .map {
-                " ".repeat(whitespace) + it
-            }
+    private fun getJoinLore(level: Int, whitespace: Int = 0): List<String> = this.config.getStrings("join-lore").map {
+        levelPlaceholders.format(it, level)
+    }.map {
+        " ".repeat(whitespace) + it
+    }
 
     fun injectPlaceholdersInto(lore: List<String>, player: Player, forceLevel: Int? = null): List<String> {
-        val withPlaceholders = lore
-            .map {
-                it.replace("%percentage_progress%", (player.getJobProgress(this) * 100).toNiceString())
-                    .replace("%current_xp%", player.getJobXP(this).toNiceString())
-                    .replace("%required_xp%", this.getExpForLevel(player.getJobLevel(this) + 1).let { req ->
-                        if (req == Int.MAX_VALUE) {
-                            plugin.langYml.getFormattedString("infinity")
-                        } else {
-                            req.toNiceString()
-                        }
+        val withPlaceholders = lore.map {
+            it.replace("%percentage_progress%", (player.getJobProgress(this) * 100).toNiceString())
+                .replace("%current_xp%", player.getJobXP(this).toNiceString())
+                .replace("%required_xp%", this.getExpForLevel(player.getJobLevel(this) + 1).let { req ->
+                    if (req == Int.MAX_VALUE) {
+                        plugin.langYml.getFormattedString("infinity")
+                    } else {
+                        req.toNiceString()
                     }
-                    )
-                    .replace("%description%", this.description)
-                    .replace("%job%", this.name)
-                    .replace("%level%", (forceLevel ?: player.getJobLevel(this)).toString())
-                    .replace("%join_price%", this.joinPrice.getDisplay(player))
-                    .replace("%leave_price%", this.leavePrice.getDisplay(player))
-            }
-            .toMutableList()
+                }).replace("%description%", this.description).replace("%job%", this.name)
+                .replace("%level%", (forceLevel ?: player.getJobLevel(this)).toString())
+                .replace("%level_numeral%", NumberUtils.toNumeral(forceLevel ?: player.getJobLevel(this)))
+                .replace("%join_price%", this.joinPrice.getDisplay(player))
+                .replace("%leave_price%", this.leavePrice.getDisplay(player))
+        }.toMutableList()
 
         val processed = mutableListOf<List<String>>()
 
@@ -328,35 +318,33 @@ class Job(
 
         val level = player.getJobLevel(this)
 
-        return ItemStackBuilder(base)
-            .setDisplayName(
-                plugin.configYml.getFormattedString("gui.job-icon.name")
-                    .replace("%level%", level.toString())
-                    .replace("%job%", this.name)
-            )
-            .addLoreLines {
-                injectPlaceholdersInto(plugin.configYml.getStrings("gui.job-icon.lore"), player) +
-                        when (player.activeJob) {
-                            this -> plugin.configYml.getStrings("gui.job-icon.active-lore")
-                            null -> plugin.configYml.getStrings("gui.job-icon.join-lore")
-                            else -> emptyList()
-                        }
+        return ItemStackBuilder(base).setDisplayName(
+            plugin.configYml.getFormattedString("gui.job-icon.name").replace("%level%", level.toString())
+                .replace("%level_numeral%", NumberUtils.toNumeral(level)).replace("%job%", this.name)
+        ).addLoreLines {
+            injectPlaceholdersInto(
+                plugin.configYml.getStrings("gui.job-icon.lore"), player
+            ) + if (player.hasJobActive(this)) {
+                plugin.configYml.getStrings("gui.job-icon.active-lore")
+            } else if (player.canJoinJob(this)) {
+                plugin.configYml.getStrings("gui.job-icon.join-lore")
+            } else if (player.activeJobs.size == player.jobLimit) {
+                plugin.configYml.getStrings("gui.job-icon.too-many-jobs-lore")
+            } else {
+                emptyList()
             }
-            .build()
+        }.build()
     }
 
     fun getJobInfoIcon(player: Player): ItemStack {
         val base = baseItem.clone()
-        return ItemStackBuilder(base)
-            .setDisplayName(
-                plugin.configYml.getFormattedString("gui.job-info.active.name")
-                    .replace("%level%", player.getJobLevel(this).toString())
-                    .replace("%job%", this.name)
-            )
-            .addLoreLines {
-                injectPlaceholdersInto(plugin.configYml.getStrings("gui.job-info.active.lore"), player)
-            }
-            .build()
+        return ItemStackBuilder(base).setDisplayName(
+            plugin.configYml.getFormattedString("gui.job-info.active.name")
+                .replace("%level%", player.getJobLevel(this).toString())
+                .replace("%level_numeral%", NumberUtils.toNumeral(player.getJobLevel(this))).replace("%job%", this.name)
+        ).addLoreLines {
+            injectPlaceholdersInto(plugin.configYml.getStrings("gui.job-info.active.lore"), player)
+        }.build()
     }
 
     fun getExpForLevel(level: Int): Int {
@@ -375,8 +363,16 @@ class Job(
         }
     }
 
-    fun getXP(event: TriggerPreProcessEvent): Double {
-        return jobXpGains.sumOf { it.getCount(event) }
+    fun getTop(place: Int): LeaderboardCacheEntry? {
+        return topCache.get(place) {
+            val players = Bukkit.getOfflinePlayers().sortedByDescending { it.getJobLevel(this) }
+            val target = players.getOrNull(place - 1) ?: return@get null
+            return@get LeaderboardCacheEntry(target, target.getJobLevel(this))
+        }
+    }
+
+    override fun getID(): String {
+        return this.id
     }
 
     override fun equals(other: Any?): Boolean {
@@ -393,11 +389,15 @@ class Job(
 }
 
 private class LevelPlaceholder(
-    val id: String,
-    private val function: (Int) -> String
+    val id: String, private val function: (Int) -> String
 ) {
     operator fun invoke(level: Int) = function(level)
 }
+
+data class LeaderboardCacheEntry(
+    val player: OfflinePlayer,
+    val amount: Int
+)
 
 private fun Collection<LevelPlaceholder>.format(string: String, level: Int): String {
     var process = string
@@ -407,85 +407,11 @@ private fun Collection<LevelPlaceholder>.format(string: String, level: Int): Str
     return process
 }
 
-private val activeJobKey: PersistentDataKey<String> = PersistentDataKey(
-    EcoJobsPlugin.instance.namespacedKeyFactory.create("active_job"),
-    PersistentDataKeyType.STRING,
-    ""
-)
+fun OfflinePlayer.getJobLevelObject(job: Job): JobLevel = job.getLevel(this.getJobLevel(job))
 
-var OfflinePlayer.activeJob: Job?
-    get() = Jobs.getByID(this.profile.read(activeJobKey))
-    set(job) {
-        val oldJob = this.activeJob
-
-        if (oldJob != job) {
-            // Have to check for oldJob too to have null safety
-            if (job == null && oldJob != null) {
-                val event = PlayerJobLeaveEvent(this, oldJob)
-                Bukkit.getPluginManager().callEvent(event)
-
-                if (event.isCancelled) {
-                    return
-                }
-            }
-
-            // Not using else because null safety as well
-            if (job != null) {
-                val event = PlayerJobJoinEvent(this, job, oldJob)
-                Bukkit.getPluginManager().callEvent(event)
-
-                if (event.isCancelled) {
-                    return
-                }
-            }
-        }
-
-        this.profile.write(activeJobKey, job?.id ?: "")
-    }
-
-val OfflinePlayer.activeJobLevel: JobLevel?
-    get() {
-        val active = this.activeJob ?: return null
-        return this.getJobLevelObject(active)
-    }
-
-fun OfflinePlayer.getJobLevel(job: Job): Int =
-    this.profile.read(job.levelKey)
-
-fun OfflinePlayer.setJobLevel(job: Job, level: Int) =
-    this.profile.write(job.levelKey, level)
-
-fun OfflinePlayer.resetJob(job: Job) {
-    this.setJobLevel(job, 1)
-    this.setJobXP(job, 0.0)
+private val expMultiplierCache = Caffeine.newBuilder().expireAfterWrite(10, TimeUnit.SECONDS).build<Player, Double> {
+    it.cacheJobExperienceMultiplier()
 }
-
-fun OfflinePlayer.getJobProgress(job: Job): Double {
-    val currentXP = this.getJobXP(job)
-    val requiredXP = job.getExpForLevel(this.getJobLevel(job) + 1)
-    return currentXP / requiredXP
-}
-
-fun OfflinePlayer.getJobLevelObject(job: Job): JobLevel =
-    job.getLevel(this.getJobLevel(job))
-
-fun OfflinePlayer.hasJob(job: Job): Boolean =
-    this.getJobLevel(job) > 0
-
-fun OfflinePlayer.getJobXP(job: Job): Double =
-    this.profile.read(job.xpKey)
-
-fun OfflinePlayer.setJobXP(job: Job, xp: Double) =
-    this.profile.write(job.xpKey, xp)
-
-fun OfflinePlayer.getJobXPRequired(job: Job): Int =
-    job.getExpForLevel(this.getJobLevel(job) + 1)
-
-private val expMultiplierCache = Caffeine.newBuilder()
-    .expireAfterWrite(10, TimeUnit.SECONDS)
-    .build<Player, Double> {
-        it.cacheJobExperienceMultiplier()
-    }
 
 val Player.jobExperienceMultiplier: Double
     get() = expMultiplierCache.get(this)
@@ -507,43 +433,19 @@ private fun Player.cacheJobExperienceMultiplier(): Double {
         return 1.5
     }
 
-    val prefix = "ecojobs.xpmultiplier."
+    return 1 + getNumericalPermission("ecojobs.xpmultiplier", 0.0) / 100
+}
+
+fun Player.getNumericalPermission(permission: String, default: Double): Double {
+    var highest: Double? = null
+
     for (permissionAttachmentInfo in this.effectivePermissions) {
-        val permission = permissionAttachmentInfo.permission
-        if (permission.startsWith(prefix)) {
-            return ((permission.substring(permission.lastIndexOf(".") + 1).toDoubleOrNull() ?: 100.0) / 100) + 1
+        val perm = permissionAttachmentInfo.permission
+        if (perm.startsWith(permission)) {
+            val found = perm.substring(perm.lastIndexOf(".") + 1).toDoubleOrNull() ?: continue
+            highest = max(highest ?: Double.MIN_VALUE, found)
         }
     }
 
-    return 1.0
-}
-
-fun Player.giveJobExperience(job: Job, experience: Double, noMultiply: Boolean = false) {
-    val exp = abs(if (noMultiply) experience else experience * this.jobExperienceMultiplier)
-
-    val gainEvent = PlayerJobExpGainEvent(this, job, exp, !noMultiply)
-    Bukkit.getPluginManager().callEvent(gainEvent)
-
-    if (gainEvent.isCancelled) {
-        return
-    }
-
-    this.giveExactJobExperience(job, gainEvent.amount)
-}
-
-fun Player.giveExactJobExperience(job: Job, experience: Double) {
-    val level = this.getJobLevel(job)
-
-    val progress = this.getJobXP(job) + experience
-
-    if (progress >= job.getExpForLevel(level + 1) && level + 1 <= job.maxLevel) {
-        val overshoot = progress - job.getExpForLevel(level + 1)
-        this.setJobXP(job, 0.0)
-        this.setJobLevel(job, level + 1)
-        val levelUpEvent = PlayerJobLevelUpEvent(this, job, level + 1)
-        Bukkit.getPluginManager().callEvent(levelUpEvent)
-        this.giveExactJobExperience(job, overshoot)
-    } else {
-        this.setJobXP(job, progress)
-    }
+    return highest ?: default
 }
